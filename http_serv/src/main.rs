@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
+
+use serde_json::{json, Value};
 
 const ACCESS_KEY: &str = "debugger";
 
@@ -62,12 +65,11 @@ fn handle_connection(mut stream: TcpStream) {
 
     println!("Request: {}", full_path);
 
-    let response = if path == "/" {
-        handle_root_json_response()
-    } else if path.starts_with("/proc/") && path.ends_with("/status") {
-        handle_proc_status_json_response(path)
-    } else {
-        handle_proc_file_response(path)
+    let response = match path {
+        "/" => handle_root_json_response(),
+        "/proc" => handle_proc_list_response(),
+        _ if path.starts_with("/proc/") => handle_proc_path_response(path),
+        _ => json_error_response(404, "Not Found"),
     };
 
     let _ = stream.write_all(response.as_bytes());
@@ -91,16 +93,17 @@ fn handle_root_json_response() -> String {
                         parts[2].parse::<f32>(),
                         parts[3].parse::<u64>(),
                     ) {
-                        processes.push(format!(
-                            r#"{{"pid": {}, "name": "{}", "cpu": {:.2}, "mem_kb": {}}}"#,
-                            pid, parts[1], cpu, rss
-                        ));
+                        processes.push(json!({
+                            "pid": pid,
+                            "name": parts[1],
+                            "cpu": cpu,
+                            "mem_kb": rss
+                        }));
                     }
                 }
             }
 
-            let json_array = format!("[{}]", processes.join(","));
-            let body = format!(r#"{{"processes": {}}}"#, json_array);
+            let body = json!({ "processes": processes }).to_string();
 
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -108,22 +111,23 @@ fn handle_root_json_response() -> String {
                 body
             )
         }
-        Err(_) => "HTTP/1.1 500 Internal Server Error\r\n\r\nFailed to run 'ps'.".to_string(),
+        Err(_) => json_error_response(500, "Failed to run 'ps'"),
     }
 }
 
-fn handle_proc_status_json_response(path: &str) -> String {
-    let parts: Vec<&str> = path.trim_start_matches("/proc/").split('/').collect();
-    if parts.len() < 2 {
-        return "HTTP/1.1 400 Bad Request\r\n\r\nInvalid /proc status path.".to_string();
-    }
-    let pid = parts[0];
+// New handler: list all numeric directories in /proc as PIDs
+fn handle_proc_list_response() -> String {
+    match fs::read_dir("/proc") {
+        Ok(entries) => {
+            let mut pids = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.chars().all(|c| c.is_ascii_digit()) {
+                    pids.push(name);
+                }
+            }
 
-    let file_path = PathBuf::from("/proc").join(pid).join("status");
-    match std::fs::read_to_string(&file_path) {
-        Ok(contents) => {
-            let json_map = parse_status_to_json(&contents);
-            let body = serde_json::to_string_pretty(&json_map).unwrap_or_else(|_| "{}".to_string());
+            let body = json!({ "pids": pids }).to_string();
 
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -131,7 +135,69 @@ fn handle_proc_status_json_response(path: &str) -> String {
                 body
             )
         }
-        Err(_) => "HTTP/1.1 404 Not Found\r\n\r\nFile not found.".to_string(),
+        Err(_) => json_error_response(500, "Failed to read /proc directory"),
+    }
+}
+
+// New handler: list files inside /proc/{pid}
+fn handle_proc_path_response(path: &str) -> String {
+    let trimmed = path.trim_start_matches("/proc/");
+    let mut parts = trimmed.split('/');
+
+    let pid = match parts.next() {
+        Some(p) if p.chars().all(|c| c.is_ascii_digit()) => p,
+        _ => return json_error_response(400, "Invalid PID"),
+    };
+
+    match parts.next() {
+        None => {
+            // No file specified → list files for that PID
+            let proc_pid_path = PathBuf::from("/proc").join(pid);
+            match fs::read_dir(proc_pid_path) {
+                Ok(entries) => {
+                    let mut files = Vec::new();
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        files.push(fname);
+                    }
+                    let body = json!({ "files": files }).to_string();
+
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                }
+                Err(_) => json_error_response(404, "PID directory not found"),
+            }
+        }
+        Some(filename) => {
+            // File requested — serve file contents (text/plain or JSON if status)
+            let file_path = PathBuf::from("/proc").join(pid).join(filename);
+
+            match fs::read_to_string(&file_path) {
+                Ok(contents) => {
+                    // If "status" file, parse to JSON
+                    if filename == "status" {
+                        let map = parse_status_to_json(&contents);
+                        let body = serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string());
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        // Serve plain text for other files
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                            contents.len(),
+                            contents
+                        )
+                    }
+                }
+                Err(_) => json_error_response(404, "File not found or unreadable"),
+            }
+        }
     }
 }
 
@@ -147,24 +213,26 @@ fn parse_status_to_json(status_text: &str) -> HashMap<String, String> {
     map
 }
 
-fn handle_proc_file_response(path: &str) -> String {
-    let clean_path = Path::new(path)
-        .components()
-        .filter_map(|comp| match comp {
-            std::path::Component::Normal(part) => Some(part),
-            _ => None,
-        })
-        .collect::<PathBuf>();
+fn json_error_response(code: u16, message: &str) -> String {
+    let body = json!({ "error": message }).to_string();
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        code,
+        http_status_text(code),
+        body.len(),
+        body
+    )
+}
 
-    let file_path = PathBuf::from("/proc").join(clean_path);
-
-    match std::fs::read_to_string(&file_path) {
-        Ok(contents) => format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-            contents.len(),
-            contents
-        ),
-        Err(_) => "HTTP/1.1 404 Not Found\r\n\r\nFile not found.".to_string(),
+fn http_status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "Unknown",
     }
 }
 
